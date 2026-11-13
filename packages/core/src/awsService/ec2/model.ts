@@ -223,7 +223,16 @@ export class Ec2Connecter implements vscode.Disposable {
             const message = err instanceof SshError ? `Testing SSM connection to instance failed: ${err.message}` : ''
             this.throwConnectionError(message, selection, { ...(err as Error), code: 'EC2SSMTestConnect' })
         } finally {
-            await this.ssm.terminateSession(testSession)
+            // The test session is usually already closed by session-manager-plugin when ssh exits, in which case
+            // TerminateSession fails with "Session is not in a valid state". That must not fail the (successful)
+            // connection, nor mask the real error from the try block.
+            await this.ssm.terminateSession(testSession).catch((e) => {
+                getLogger().warn(
+                    'ec2: failed to terminate test session %s: %s',
+                    testSession.SessionId,
+                    (e as Error).message
+                )
+            })
         }
     }
 

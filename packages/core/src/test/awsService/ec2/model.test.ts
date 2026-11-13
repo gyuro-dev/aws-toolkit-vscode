@@ -5,7 +5,7 @@
 
 import assert from 'assert'
 import * as sinon from 'sinon'
-import { Ec2Connecter, getRemoveLinesCommand } from '../../../awsService/ec2/model'
+import { Ec2Connecter, Ec2RemoteEnv, getRemoveLinesCommand } from '../../../awsService/ec2/model'
 import { SsmClient } from '../../../shared/clients/ssm'
 import { Ec2Client } from '../../../shared/clients/ec2'
 import { Ec2Selection } from '../../../awsService/ec2/prompter'
@@ -15,7 +15,8 @@ import { IamClient, IamRole } from '../../../shared/clients/iam'
 import { assertNoTelemetryMatch, createTestWorkspaceFolder } from '../../testUtil'
 import { fs } from '../../../shared'
 import path from 'path'
-import { ChildProcess } from '../../../shared/utilities/processUtils'
+import { ChildProcess, ChildProcessResult } from '../../../shared/utilities/processUtils'
+import { RemoteSshSettings } from '../../../shared/extensions/ssh'
 import { isMac, isWin } from '../../../shared/vscode/env'
 import { inspect } from '../../../shared/utilities/collectionUtils'
 import { assertLogsContain } from '../../globalSetup.test'
@@ -249,6 +250,64 @@ describe('Ec2ConnectClient', function () {
             })
             sinon.restore()
             assertLogsContain('failed to clean keys', false, 'warn')
+        })
+    })
+
+    describe('tryOpenRemoteConnection', async function () {
+        const selection: Ec2Selection = { instanceId: 'test-id', region: 'test-region' }
+        const testSession = {
+            SessionId: 'test-session',
+            StreamUrl: 'wss://example',
+            TokenValue: 'token',
+            $metadata: {},
+        }
+        let sshShouldFail: boolean
+
+        class FakeProcess extends ChildProcess {
+            public override async run(): Promise<ChildProcessResult> {
+                if (sshShouldFail) {
+                    throw new Error('ssh failed')
+                }
+                return { exitCode: 0, error: undefined, stdout: '', stderr: '' }
+            }
+        }
+
+        beforeEach(function () {
+            sshShouldFail = false
+            sinon.stub(Ec2Connecter.prototype, 'checkForStartSessionError').resolves()
+            sinon.stub(Ec2Connecter.prototype, 'getRemoteUser').resolves({ name: 'ec2-user', os: 'Amazon Linux' })
+            sinon.stub(Ec2Connecter.prototype, 'prepareEc2RemoteEnvWithProgress').resolves({
+                hostname: 'aws-ec2-test-id',
+                sshPath: 'ssh',
+                vscPath: 'code',
+                SessionProcess: FakeProcess,
+            } as unknown as Ec2RemoteEnv)
+            sinon.stub(SsmClient.prototype, 'startSession').resolves(testSession)
+            // Already closed by session-manager-plugin when ssh exited.
+            sinon
+                .stub(SsmClient.prototype, 'terminateSession')
+                .rejects(new Error('ValidationException: Session is not in a valid state'))
+            sinon.stub(RemoteSshSettings.prototype, 'ensureDefaultExtension').resolves(true)
+            sinon.stub(RemoteSshSettings.prototype, 'setRemotePlatform').resolves(true)
+            sinon.stub(RemoteSshSettings.prototype, 'update').resolves(true)
+        })
+
+        afterEach(function () {
+            sinon.restore()
+        })
+
+        it('succeeds even if the test session was already terminated', async function () {
+            await client.tryOpenRemoteConnection(selection)
+            assertLogsContain('failed to terminate test session', false, 'warn')
+        })
+
+        it('reports the ssh test failure, not the TerminateSession failure', async function () {
+            sshShouldFail = true
+            await assert.rejects(client.tryOpenRemoteConnection(selection), (e: ToolkitError) => {
+                assert.strictEqual(e.code, 'EC2SSMTestConnect')
+                assert.ok(!e.message.includes('Session is not in a valid state'), e.message)
+                return true
+            })
         })
     })
 })
