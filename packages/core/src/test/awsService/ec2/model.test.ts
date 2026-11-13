@@ -262,6 +262,13 @@ describe('Ec2ConnectClient', function () {
             $metadata: {},
         }
         let sshShouldFail: boolean
+        let terminateSessionStub: sinon.SinonStub
+
+        function awsError(name: string, message: string): Error {
+            const e = new Error(message)
+            e.name = name
+            return e
+        }
 
         class FakeProcess extends ChildProcess {
             public override async run(): Promise<ChildProcessResult> {
@@ -283,10 +290,10 @@ describe('Ec2ConnectClient', function () {
                 SessionProcess: FakeProcess,
             } as unknown as Ec2RemoteEnv)
             sinon.stub(SsmClient.prototype, 'startSession').resolves(testSession)
-            // Already closed by session-manager-plugin when ssh exited.
-            sinon
+            // After a successful test, SSM has already ended the session (the SSH connection over it closed).
+            terminateSessionStub = sinon
                 .stub(SsmClient.prototype, 'terminateSession')
-                .rejects(new Error('ValidationException: Session is not in a valid state'))
+                .rejects(awsError('ValidationException', 'Session is not in a valid state'))
             sinon.stub(RemoteSshSettings.prototype, 'ensureDefaultExtension').resolves(true)
             sinon.stub(RemoteSshSettings.prototype, 'setRemotePlatform').resolves(true)
             sinon.stub(RemoteSshSettings.prototype, 'update').resolves(true)
@@ -298,7 +305,16 @@ describe('Ec2ConnectClient', function () {
 
         it('succeeds even if the test session was already terminated', async function () {
             await client.tryOpenRemoteConnection(selection)
-            assertLogsContain('failed to terminate test session', false, 'warn')
+            sinon.assert.calledOnce(terminateSessionStub)
+            assertLogsContain('failed to terminate test session', false, 'debug')
+        })
+
+        it('warns, but still succeeds, if the test session cannot be terminated for another reason', async function () {
+            terminateSessionStub.rejects(
+                awsError('AccessDeniedException', 'not authorized to perform ssm:TerminateSession')
+            )
+            await client.tryOpenRemoteConnection(selection)
+            assertLogsContain('not authorized to perform ssm:TerminateSession', false, 'warn')
         })
 
         it('reports the ssh test failure, not the TerminateSession failure', async function () {
